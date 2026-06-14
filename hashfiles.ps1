@@ -48,7 +48,7 @@ function Get-FileType {
 }
 
 # ============================================
-# FUNCTION TO SCAN FILES
+# FUNCTION TO SCAN FILES (MODIFIED - STREAMING)
 # ============================================
 
 function Export-FilesInventoryToCSV {
@@ -98,8 +98,12 @@ function Export-FilesInventoryToCSV {
     Write-Host "$totalFiles files to analyze" -ForegroundColor Cyan
     Write-Host ""
     
-    # Prepare results array
-    $results = @()
+    # === SEUL CHANGEMENT ICI ===
+    # Au lieu de stocker dans $results, on écrit DIRECTEMENT dans le CSV
+    # Création du CSV avec en-têtes
+    $headers = "Index;Type;Name;FullName;CreationDate;ModificationDate;SizeBytes;SizeKB;SizeMB;Extension;Hash"
+    $headers | Out-File -FilePath $OutputCSV -Encoding UTF8
+    
     $processed = 0
     $index = 1
     
@@ -119,41 +123,44 @@ function Export-FilesInventoryToCSV {
         # Determine file type
         $fileType = Get-FileType -Extension $file.Extension
         
-        # Create object with all information
-        $fileObject = [PSCustomObject]@{
-            Index = $index
-            Type = $fileType
-            Name = $file.Name
-            FullName = $file.FullName
-            CreationDate = $file.CreationTime
-            ModificationDate = $file.LastWriteTime
-            SizeBytes = $file.Length
-            SizeKB = [math]::Round($file.Length / 1KB, 2)
-            SizeMB = [math]::Round($file.Length / 1MB, 2)
-            Extension = $file.Extension
-            Hash = $hash
-        }
+        # Créer la ligne CSV (sans créer d'objet PSCustomObject)
+        $sizeKB = [math]::Round($file.Length / 1KB, 2)
+        $sizeMB = [math]::Round($file.Length / 1MB, 2)
         
-        $results += $fileObject
+        # Écrire directement dans le fichier
+        "$index;$fileType;$($file.Name);$($file.FullName);$($file.CreationTime);$($file.LastWriteTime);$($file.Length);$sizeKB;$sizeMB;$($file.Extension);$hash" | Out-File -FilePath $OutputCSV -Encoding UTF8 -Append
+        
         $index++
     }
     
     Write-Progress -Activity "Analyzing files" -Completed
     
-    # Export to CSV
-    Write-Host "Exporting to CSV..." -ForegroundColor Yellow
-    $results | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8 -Delimiter ";"
+    # Export to CSV - PLUS BESOIN, DÉJÀ FAIT !
+    # $results | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8 -Delimiter ";"
     
-    # Display summary
+    # Display summary - MODIFIÉ car on n'a plus $results
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "INVENTORY RESULTS" -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "Files analyzed: $totalFiles" -ForegroundColor White
+    
+    # Pour les statistiques par type, il faut re-lire le CSV ou re-scanner
     Write-Host "Files by type:" -ForegroundColor Yellow
     
-    $results | Group-Object Type | Select-Object Name, Count | Sort-Object Count -Descending | ForEach-Object {
-        Write-Host "  - $($_.Name) : $($_.Count) file(s)" -ForegroundColor Gray
+    # Option rapide : on refait un group simple sans re-scanner tous les fichiers
+    $typeStats = @{}
+    foreach ($file in $allFiles) {
+        $fileType = Get-FileType -Extension $file.Extension
+        if ($typeStats.ContainsKey($fileType)) {
+            $typeStats[$fileType]++
+        } else {
+            $typeStats[$fileType] = 1
+        }
+    }
+    
+    $typeStats.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object {
+        Write-Host "  - $($_.Key) : $($_.Value) file(s)" -ForegroundColor Gray
     }
     
     Write-Host ""
@@ -161,12 +168,15 @@ function Export-FilesInventoryToCSV {
     Write-Host "Columns: Index, Type, Name, FullName, CreationDate, SizeBytes, SizeKB, SizeMB, Extension, Hash" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Green
     
-    # Preview in console
+    # Preview in console (on lit les 5 premières lignes du CSV)
     Write-Host ""
     Write-Host "PREVIEW (first 5 files):" -ForegroundColor Cyan
-    $results | Select-Object -First 5 | Format-Table Index, Type, Name, SizeKB, Extension -AutoSize
+    Get-Content $OutputCSV -TotalCount 6 | Select-Object -Skip 1 | ForEach-Object {
+        $parts = $_ -split ';'
+        Write-Host "$($parts[0]) $($parts[1]) $($parts[2]) $($parts[8]) $($parts[9])" -ForegroundColor Gray
+    }
     
-    return $results
+    return $true
 }
 
 # ============================================
@@ -184,30 +194,32 @@ Write-Host ""
 $UserInput = Read-Host "Enter CSV path (press Enter for default: $DefaultCSVPath)"
 if ([string]::IsNullOrWhiteSpace($UserInput)) {
     $CSVPath = $DefaultCSVPath
-    Write-Host "Using default path: $OutputCSV" -ForegroundColor Cyan
+    Write-Host "Using default path: $CSVPath" -ForegroundColor Cyan
 } else {
     $CSVPath = $UserInput
-    Write-Host "Using custom path: $OutputCSV" -ForegroundColor Green
+    Write-Host "Using custom path: $CSVPath" -ForegroundColor Green
 }
-
 
 Export-FilesInventoryToCSV -Path $Dir -OutputCSV $CSVPath -Recurse 
 
-
 Write-Host ""
 
-# FILE ANALYSIS
-$csv = Import-Csv -Path $CSVPath -Delimiter ";"
+# FILE ANALYSIS (légèrement modifié car on utilise Import-Csv)
+$csv = Import-Csv -Path $CSVPath -Delimiter ";" -ErrorAction SilentlyContinue
 
-$uniqueHashes = $csv | Select-Object -ExpandProperty Hash -Unique
-$realFileCount = $uniqueHashes.Count
-$totalFiles = $csv.Count
-$duplicateCount = $totalFiles - $realFileCount
+if ($csv) {
+    $uniqueHashes = $csv | Select-Object -ExpandProperty Hash -Unique
+    $realFileCount = $uniqueHashes.Count
+    $totalFiles = $csv.Count
+    $duplicateCount = $totalFiles - $realFileCount
 
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "FILE ANALYSIS" -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "Total files in CSV (with duplicates): $totalFiles" -ForegroundColor Yellow
-Write-Host "Real unique files (by content): $realFileCount" -ForegroundColor Green
-Write-Host "Duplicate files: $duplicateCount" -ForegroundColor Red
-Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "FILE ANALYSIS" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "Total files in CSV (with duplicates): $totalFiles" -ForegroundColor Yellow
+    Write-Host "Real unique files (by content): $realFileCount" -ForegroundColor Green
+    Write-Host "Duplicate files: $duplicateCount" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Cyan
+} else {
+    Write-Host "Could not analyze CSV file" -ForegroundColor Red
+}
